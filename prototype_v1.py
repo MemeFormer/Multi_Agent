@@ -1,206 +1,269 @@
+# prototype_v1.py
+
 import asyncio
 import subprocess
-import os
 import logging
-from src.adapters.groq_adapter import GroqAdapter # Assuming adapter is here
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import os
+import platform
+from src.adapters.groq_adapter import GroqAdapter # Correct import path
+from groq import GroqError # Import specific error
+from pydantic import ValidationError # Import potential errors
+import json # Import potential errors
 
 # --- Configuration ---
-TEST_FILENAME = "test_file.txt"
-INITIAL_CONTENT = "hello world, hello there."
-TASK_DESCRIPTION = f"Using a bash command (like sed), replace all occurrences of the word 'hello' with 'goodbye' in the file named '{TEST_FILENAME}'."
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Helper Functions ---
+# --- Model Selection ---
+JUNIOR_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+SENIOR_MODEL = "deepseek-r1-distill-qwen-32b"
 
-def setup_test_file():
-    """Creates the initial test file."""
+# --- Environment Setup ---
+# (Keep the environment setup code as is)
+os.makedirs("docs", exist_ok=True)
+compatibility_notes_path = "docs/command_compatibility_notes.md"
+if not os.path.exists(compatibility_notes_path):
+    logging.warning(f"{compatibility_notes_path} not found. Creating an empty file.")
+    with open(compatibility_notes_path, "w") as f:
+        f.write("# Command Compatibility & Issue Notes\n\n---\n\n## macOS/BSD `sed -i`\n* Correct: `sed -i '' 's/old/new/g' filename`\n")
+
+
+# --- Agent Functions ---
+
+async def junior_propose_plan(adapter: GroqAdapter, task_description: str, context: str) -> str:
+    # (Keep junior_propose_plan function as is, no reasoning_format needed here)
+    logging.info(f"Junior Agent ({JUNIOR_MODEL}) starting task: {task_description}")
+    system_prompt = """
+You are a Junior Developer Agent. Your task is to take a user request and context,
+then generate ONLY the single, precise **macOS/BSD compatible** bash command
+needed to accomplish the task. Do NOT add any explanation, introductory text,
+or markdown formatting like ```bash ... ```. Just output the raw command.
+Pay close attention to macOS/BSD compatibility, for example, macOS requires
+`sed -i ''` for in-place edits without backups.
+"""
+    user_prompt = f"""
+Task: {task_description}
+
+Context:
+{context}
+
+Based on the task and context, provide the single macOS/BSD compatible bash command:
+"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     try:
-        with open(TEST_FILENAME, "w") as f:
-            f.write(INITIAL_CONTENT)
-        logging.info(f"Created test file '{TEST_FILENAME}' with initial content.")
-    except IOError as e:
-        logging.error(f"Error creating test file: {e}", exc_info=True)
-        raise
-
-def read_test_file():
-    """Reads the content of the test file."""
-    try:
-        with open(TEST_FILENAME, "r") as f:
-            content = f.read()
-        logging.info(f"Current content of '{TEST_FILENAME}': '{content}'")
-        return content
-    except IOError as e:
-        logging.error(f"Error reading test file: {e}", exc_info=True)
-        return f"Error reading file: {e}"
-
-def execute_command(command: str) -> bool:
-    """Executes the approved bash command."""
-    logging.info(f"Attempting to execute command: {command}")
-    try:
-        # Using shell=True is necessary for pipelines, redirects etc.
-        # Be cautious with it in production - ensure commands are validated.
-        result = subprocess.run(
-            command,
-            shell=True,
-            check=True, # Raises CalledProcessError on non-zero exit code
-            capture_output=True, # Capture stdout/stderr
-            text=True # Decode stdout/stderr as text
-        )
-        logging.info(f"Command executed successfully. STDOUT:\n{result.stdout}")
-        if result.stderr:
-             logging.warning(f"Command STDERR:\n{result.stderr}")
-        return True
-    except FileNotFoundError:
-         logging.error(f"Error: Command not found (invalid command or PATH issue?) - Command: '{command}'")
-         return False
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Command failed with exit code {e.returncode}. Command: '{command}'")
-        logging.error(f"STDERR:\n{e.stderr}")
-        logging.error(f"STDOUT:\n{e.stdout}")
-        return False
-    except Exception as e:
-        logging.error(f"An unexpected error occurred during command execution: {e}", exc_info=True)
-        return False
-
-# --- Simulated Agent Functions ---
-
-async def junior_propose_plan(adapter: GroqAdapter, task: str) -> str | None:
-    """Simulates Junior agent proposing a bash command plan."""
-    logging.info("Junior Agent: Proposing execution plan...")
-    prompt = f"""
-    Given the following task, generate ONLY the single, precise bash command needed to accomplish it.
-    Do not include explanations, just the command itself.
-    Use standard tools like 'sed'. Assume the file is in the current directory.
-
-    Task: {task}
-
-    Bash Command:
-    """
-    messages = [{"role": "user", "content": prompt}]
-
-    try:
-        # Using prefill to encourage just the command output
+        logging.info(f"Junior agent calling Groq API with model: {JUNIOR_MODEL}")
         response_gen = await adapter.chat_completion(
-            messages=messages,
-            temperature=0.1, # Low temp for predictable command generation
-            max_tokens=100,
-            stream=True, # Stream to get output faster / potentially stop early
-            prefill_content="", # No specific prefill needed here if prompt is clear
-            # stop=["\n"] # Optional: Try stopping at the first newline
-        )
-
-        proposed_command = ""
-        async for chunk in response_gen:
-             proposed_command += chunk
-        proposed_command = proposed_command.strip() # Clean up whitespace
-
-        # Basic validation - ensure it's not empty and looks like a command
-        if not proposed_command or ' ' not in proposed_command:
-             logging.error(f"Junior Agent: LLM generated invalid/empty command: '{proposed_command}'")
-             return None
-
-        logging.info(f"Junior Agent: Proposed command: `{proposed_command}`")
-        return proposed_command
-    except Exception as e:
-        logging.error(f"Junior Agent: Error during plan proposal: {e}", exc_info=True)
-        return None
-
-async def senior_review_plan(adapter: GroqAdapter, command: str, task: str) -> tuple[bool, str]:
-    """Simulates Senior agent reviewing the command."""
-    logging.info(f"Senior Agent: Reviewing command: `{command}`")
-    prompt = f"""
-    Review the following bash command intended to accomplish the task described.
-    Is the command technically correct, safe for execution in the current directory, and likely to achieve the task?
-    Focus on correctness and safety for this specific task and file ('{TEST_FILENAME}').
-
-    Task: {task}
-    Proposed Bash Command: `{command}`
-
-    Your Response: Start your response with either "APPROVAL: YES" or "APPROVAL: NO".
-    Then, optionally provide a brief justification or suggested correction on the next line.
-    Example APPROVAL: YES\nLooks correct for replacing all occurrences with sed -i.
-    Example APPROVAL: NO\nThe sed syntax is missing the -i flag for in-place edit or redirection.
-    """
-    messages = [{"role": "user", "content": prompt}]
-    feedback = "No feedback received."
-    approved = False
-
-    try:
-        response = await adapter.chat_completion(
+            model=JUNIOR_MODEL,
             messages=messages,
             temperature=0.1,
-            max_tokens=100,
-            stream=False # Need full response to parse APPROVAL
+            max_tokens=2500,
+            top_p=1,
+            stop=None,
+            stream=False,
+            # No reasoning_format needed for this agent/model
         )
-        review_text = response.choices[0].message.content.strip()
-        logging.info(f"Senior Agent: Raw review response: '{review_text}'")
-
-        # Parse the approval status
-        if review_text.upper().startswith("APPROVAL: YES"):
-            approved = True
-            feedback = review_text[len("APPROVAL: YES"):].strip()
-            logging.info(f"Senior Agent: Plan APPROVED. Feedback: {feedback}")
-        elif review_text.upper().startswith("APPROVAL: NO"):
-            approved = False
-            feedback = review_text[len("APPROVAL: NO"):].strip()
-            logging.warning(f"Senior Agent: Plan REJECTED. Feedback: {feedback}")
+        if response_gen and response_gen.choices and response_gen.choices[0].message and response_gen.choices[0].message.content:
+            proposed_command = response_gen.choices[0].message.content.strip()
+            if proposed_command.startswith("```bash"):
+                proposed_command = proposed_command.replace("```bash", "").replace("```", "").strip()
+            elif proposed_command.startswith("`") and proposed_command.endswith("`"):
+                 proposed_command = proposed_command[1:-1]
+            logging.info(f"Junior Agent proposed command: '{proposed_command}'")
+            return proposed_command
         else:
-             logging.warning(f"Senior Agent: Could not parse approval status from response: '{review_text}'")
-             feedback = f"Unparsable response: {review_text}"
-             approved = False # Default to not approved if unsure
-
-        return approved, feedback
+            logging.error("Junior Agent received an empty or invalid response content.")
+            return "ERROR: No command generated."
+    except GroqError as e:
+        logging.error(f"Junior Agent failed due to Groq API error: {e}")
+        return f"ERROR: API call failed - {e}"
+    except (ValueError, ValidationError, json.JSONDecodeError) as e:
+         logging.error(f"Junior Agent failed due to data error: {e}")
+         return f"ERROR: Data validation/processing error - {e}"
     except Exception as e:
-        logging.error(f"Senior Agent: Error during plan review: {e}", exc_info=True)
-        return False, f"Error during review: {e}"
+        logging.error(f"An unexpected error occurred in Junior Agent: {e}", exc_info=True)
+        return f"ERROR: Unexpected error - {e}"
+
+async def senior_review_plan(adapter: GroqAdapter, task_description: str, proposed_command: str, context: str) -> bool:
+    """
+    Senior agent reviews the proposed command for correctness, safety, and relevance.
+    Uses reasoning_format='hidden' for the Deepseek model.
+    """
+    logging.info(f"Senior Agent ({SENIOR_MODEL}) reviewing command: '{proposed_command}'")
+
+    if proposed_command.startswith("ERROR:") or not proposed_command:
+        logging.warning("Senior Agent automatically REJECTING due to upstream error or empty command.")
+        return False
+
+    # Note: As per Deepseek docs, avoiding system prompts might be better.
+    # Combining prompts for now, but consider refactoring later if needed.
+    combined_prompt = f"""
+You are a Senior Developer Agent. Your role is to review a proposed bash command
+generated by a Junior Agent. Evaluate the command based on the original task
+and context. Your review criteria are:
+1. Technical Correctness: Is the command syntax valid?
+2. Safety: Is the command likely to cause unintended data loss or system harm?
+   (e.g., risky `rm` commands, incorrect redirection).
+3. Relevance: Does the command directly address the task description?
+4. macOS/BSD Compatibility: Is the command compatible with standard macOS/BSD shell environments?
+   (e.g., Does it correctly use `sed -i ''` for in-place edits if required?)
+
+Original Task: {task_description}
+
+Context:
+{context}
+
+Proposed Bash Command:
+`{proposed_command}`
+
+Review Checklist:
+1. Technically Correct?
+2. Safe to execute?
+3. Relevant to task?
+4. macOS/BSD Compatible (e.g., `sed -i ''` if needed)?
+
+Respond with ONLY "APPROVE" or "REJECT". Do not add explanations or any other text.
+Decision (APPROVE or REJECT):
+"""
+
+    messages = [
+        # Removed system prompt based on Deepseek R1 recommendation
+        {"role": "user", "content": combined_prompt},
+    ]
+
+    try:
+        logging.info(f"Senior agent calling Groq API with model: {SENIOR_MODEL}, reasoning_format='hidden'")
+        response = await adapter.chat_completion(
+            model=SENIOR_MODEL,
+            messages=messages,
+            temperature=0.1, # Keep deterministic
+            max_tokens=1000,   # Keep small
+            top_p=1,
+            stop=None,
+            stream=False,
+            reasoning_format='hidden' # <<< ADDED THIS PARAMETER
+        )
+
+        # Check response structure more carefully
+        if response and response.choices and response.choices[0].message and response.choices[0].message.content:
+            decision = response.choices[0].message.content.strip().upper()
+            # Adding logging for the raw decision received
+            logging.info(f"Senior Agent raw decision received: '{decision}'")
+            if decision == "APPROVE":
+                logging.info("Senior Agent decision: APPROVE")
+                return True
+            elif decision == "REJECT":
+                 logging.info("Senior Agent decision: REJECT")
+                 return False
+            else:
+                 # If reasoning_format='hidden' worked, this shouldn't happen often,
+                 # but good to keep as a fallback.
+                 logging.warning(f"Senior Agent gave ambiguous response despite reasoning_format='hidden': '{decision}'. Defaulting to REJECT.")
+                 return False
+        else:
+            logging.error("Senior Agent received an empty or invalid response content.")
+            return False # Default to reject on error
+
+    except GroqError as e:
+        logging.error(f"Senior Agent failed due to Groq API error: {e}")
+        return False # Default to reject on error
+    except (ValueError, ValidationError, json.JSONDecodeError) as e:
+         logging.error(f"Senior Agent failed due to data error: {e}")
+         return False # Default to reject on error
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in Senior Agent: {e}", exc_info=True)
+        return False # Default to reject on error
 
 
-# --- Main Orchestration Logic ---
+def execute_command(command: str) -> tuple[bool, str, str]:
+    # (Keep execute_command function as is)
+    if not command or command.startswith("ERROR:"):
+        logging.error(f"Skipping execution due to invalid command: '{command}'")
+        return False, "", "Invalid command provided"
+    logging.info(f"Executing command: '{command}'")
+    try:
+        process = subprocess.run(
+            command, shell=True, check=False, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        if process.returncode == 0:
+            logging.info(f"Command executed successfully. stdout:\n{process.stdout.strip()}")
+            return True, process.stdout, process.stderr
+        else:
+            logging.error(f"Command failed with exit code {process.returncode}. stderr:\n{process.stderr.strip()}")
+            return False, process.stdout, process.stderr
+    except FileNotFoundError:
+        err_msg = f"Error: Command not found. Make sure '{command.split()[0]}' is installed and in your PATH."
+        logging.error(err_msg)
+        return False, "", err_msg
+    except Exception as e:
+        err_msg = f"An unexpected error occurred during command execution: {e}"
+        logging.error(err_msg)
+        return False, "", err_msg
 
 async def main():
-    """Runs the prototype workflow."""
+    # (Keep main function largely as is)
     logging.info("--- Starting Prototype V1 ---")
-    adapter = GroqAdapter() # Assumes GROQ_API_KEY is set
-
-    # 1. Setup
-    setup_test_file()
-    read_test_file() # Log initial state
-
-    # 2. Junior Proposes Plan
-    proposed_command = await junior_propose_plan(adapter, TASK_DESCRIPTION)
-
-    if not proposed_command:
-        logging.error("Workflow failed: Junior could not propose a plan.")
+    try:
+        groq_adapter = GroqAdapter()
+        logging.info("Groq Adapter initialized.")
+        logging.info("Attempting first API call via Junior Agent to confirm connectivity...")
+    except ValueError as e:
+         logging.error(f"Failed to initialize Groq Adapter: {e}")
+         return
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during adapter initialization: {e}", exc_info=True)
         return
 
-    # 3. Senior Reviews Plan
-    is_approved, feedback = await senior_review_plan(adapter, proposed_command, TASK_DESCRIPTION)
+    task = "In the file 'test_file.txt', replace all occurrences of the word 'hello' with 'goodbye'."
+    logging.info(f"Defined Task: {task}")
 
-    # 4. Execute if Approved
-    if is_approved:
-        logging.info("Executing approved command...")
-        success = execute_command(proposed_command)
-        if success:
-            logging.info("Command execution reported success.")
+    test_file = "test_file.txt"
+    logging.info(f"Setting up test environment: Creating {test_file}")
+    try:
+        with open(test_file, "w") as f:
+            f.write("hello world\n")
+            f.write("another hello line\n")
+            f.write("hello again\n")
+        file_content_before = open(test_file).read()
+        logging.info(f"Content of {test_file} before execution:\n{file_content_before.strip()}")
+        initial_context = f"Current directory contains the file '{test_file}' with the following content:\n```\n{file_content_before}```\nThe goal is to modify it in place."
+    except IOError as e:
+        logging.error(f"Failed to create or read test file {test_file}: {e}")
+        return
+
+    proposed_command = await junior_propose_plan(groq_adapter, task, initial_context)
+
+    if proposed_command and not proposed_command.startswith("ERROR:"):
+        is_approved = await senior_review_plan(groq_adapter, task, proposed_command, initial_context)
+
+        if is_approved:
+            logging.info("Plan approved by Senior Agent.")
+            success, stdout, stderr = execute_command(proposed_command)
+            if success:
+                logging.info("Command execution succeeded.")
+                try:
+                    final_content = open(test_file).read()
+                    logging.info(f"Content of {test_file} AFTER execution:\n{final_content.strip()}")
+                    if "goodbye" in final_content and "hello" not in final_content:
+                         logging.info("Verification PASSED: 'hello' replaced with 'goodbye'.")
+                    else:
+                         logging.warning("Verification WARNING: File content doesn't match expected outcome.")
+                except IOError as e:
+                    logging.error(f"Failed to read test file {test_file} after execution: {e}")
+            else:
+                logging.error(f"Command execution failed. Stdout: {stdout.strip()}, Stderr: {stderr.strip()}")
         else:
-            logging.error("Command execution reported failure.")
+            logging.warning("Plan REJECTED by Senior Agent. No command executed.")
     else:
-        logging.warning(f"Workflow halted: Plan rejected by Senior Agent. Feedback: {feedback}")
+        logging.error(f"Junior Agent failed to propose a valid command ('{proposed_command}'). Aborting.")
 
-    # 5. Final State
-    logging.info("--- Reading final file state ---")
-    read_test_file()
     logging.info("--- Prototype V1 Finished ---")
 
-    # Optional: Clean up the test file
-    # try:
-    #     os.remove(TEST_FILENAME)
-    #     logging.info(f"Cleaned up test file '{TEST_FILENAME}'.")
-    # except OSError as e:
-    #     logging.warning(f"Could not clean up test file: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
