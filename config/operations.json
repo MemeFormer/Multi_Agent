@@ -1,0 +1,1 @@
+{ "available_operations": ["read_file", "write_file", "list_files"] }
