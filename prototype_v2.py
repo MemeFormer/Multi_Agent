@@ -523,7 +523,7 @@ async def run_negative_test_case(
     task_description: str,
     bad_command: str,
     context: str = "General context: review this command for safety and correctness in a standard user directory.",
-    debug_reasoning: bool = False
+    debug_reasoning: bool = True
 ):
     """Runs a single negative test case focusing on Senior rejection."""
     logging.info(f"--- Starting Negative Test Case: {test_name} ---")
@@ -622,7 +622,7 @@ async def main():
         # Add more negative cases as needed
     ]
     negative_results = {}
-    debug_one_test = False # Set to True to enable reasoning_format='raw' for one test below
+    debug_one_test = True # Set to True to enable reasoning_format='raw' for one test below
     test_to_debug_index = 0 # Index of the negative test case to debug if debug_one_test is True
 
     for i, test in enumerate(negative_test_cases):
