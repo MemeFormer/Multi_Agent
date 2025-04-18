@@ -11,6 +11,7 @@ from src.models.word_action_plan import WordActionPlan
 from src.models.check_plan import CheckPlan
 from src.models.check_result import CheckResult
 from src.models.read_file_plan import ReadFilePlan # <-- Added for Phase 5
+from src.models.write_file_plan import WriteFilePlan # <-- Added for Phase 6
 
 # Configure logging
 # Consider moving basicConfig to the main script entry point if not already done
@@ -254,6 +255,60 @@ Create the JSON plan to read the file: "{file_path_to_read}"
             return None
         except Exception as e:
             logger.error(f"Planner unexpected error during plan_read_file_task: {e}", exc_info=True)
+            return None
+
+    async def plan_write_file_task(self, file_path: str, content: str) -> Optional[WriteFilePlan]:
+        """ Plans a task to write content to a specified file. """
+        logger.info(f"Planner Agent ({self.model_id}) planning file write for: '{file_path}'")
+        # Be cautious about logging large content strings
+        content_preview = content[:100].replace('\n', '\\n') + ('...' if len(content) > 100 else '')
+        logger.debug(f"Content preview for plan: '{content_preview}'")
+
+        # Use simplified prompt structure (no schema in text)
+        system_prompt = """
+You are a Planner Agent. Create a JSON plan for the Executor Agent to write provided content to a specified file, overwriting existing content.
+The plan MUST use the action "write_file".
+The JSON object you output MUST contain the fields 'action', 'file_path', and 'content'.
+Generate ONLY the JSON object instance.
+"""
+        # Pass content in the user prompt. Be mindful of token limits for very large content.
+        # For extremely large content, a different approach (e.g., passing a reference or using streaming)
+        # might be needed in a real application, but this works for moderate content.
+        user_prompt = f"""
+Create the JSON plan to write the following content to the file "{file_path}":
+
+Content:
+{content}
+"""
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+        try:
+            response_plan: Optional[WriteFilePlan] = await self.adapter.chat_completion(
+                model=self.model_id,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens, # May need increasing if content is large
+                json_schema=WriteFilePlan
+            )
+
+            if response_plan and isinstance(response_plan, WriteFilePlan):
+                 # Optional validation: Check file_path and maybe content hash/preview?
+                 if response_plan.file_path != file_path:
+                      logger.warning(f"Planner returned plan for different file path: '{response_plan.file_path}' instead of '{file_path}'. Using returned path.")
+                 # Add a check for content match (or preview match) if desired
+                 # if response_plan.content != content:
+                 #     logger.warning(f"Planner returned plan with different content.")
+                 logger.info(f"Planner proposed write file plan: Path='{response_plan.file_path}', Action='{response_plan.action}'")
+                 return response_plan
+            else:
+                logger.error("Planner chat_completion did not return a valid WriteFilePlan object.")
+                return None
+
+        except (GroqError, ValueError, ValidationError, json.JSONDecodeError) as e:
+            logger.error(f"Planner agent failed during write file plan proposal: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Planner unexpected error during plan_write_file_task: {e}", exc_info=True)
             return None
 
     # --- Deprecated Methods ---

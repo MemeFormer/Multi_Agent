@@ -12,6 +12,8 @@ from src.models.check_plan import CheckPlan
 from src.models.check_result import CheckResult
 from src.models.read_file_plan import ReadFilePlan       # <-- Added for Phase 5
 from src.models.file_content_result import FileContentResult # <-- Added for Phase 5
+from src.models.write_file_plan import WriteFilePlan     # <-- Added for Phase 6
+from src.models.write_file_result import WriteFileResult # <-- Added for Phase 6
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -99,6 +101,27 @@ class ExecutorAgent:
         except Exception as e:
             logger.error(f"Unexpected error reading file {file_path}: {e}", exc_info=True)
             return None
+
+    def _write_file_content(self, file_path: str, content: str) -> bool:
+        """Writes the given content to the file, overwriting existing content."""
+        logger.debug(f"Attempting to write {len(content)} characters to: {file_path}")
+        try:
+            # Ensure the directory exists (it should from __init__, but defensive check)
+            # Handle cases where file_path might be just a filename in the current dir
+            dir_name = os.path.dirname(file_path)
+            if dir_name: # Only create if dirname is not empty (i.e., not current dir)
+                 os.makedirs(dir_name, exist_ok=True)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            logger.info(f"Successfully wrote content to {file_path}")
+            return True
+        except (OSError, TypeError) as e: # Catch file errors or if content isn't string
+            logger.error(f"Error writing content to file {file_path}: {e}", exc_info=True)
+            return False
+        except Exception as e: # Catch unexpected errors
+            logger.error(f"Unexpected error writing file {file_path}: {e}", exc_info=True)
+            return False
 
     # --- Public Execution Methods ---
 
@@ -192,4 +215,47 @@ class ExecutorAgent:
             status=status,
             content=content,
             message=message
+        )
+
+    async def execute_write_file(self, plan: WriteFilePlan) -> WriteFileResult:
+        """ Executes a write file plan using the _write_file_content tool. """
+        logger.info(f"Executor Agent received plan: Write file '{plan.file_path}' using tool.")
+        success: bool = False
+        message: Optional[str] = None
+        status: Literal["Success", "Failure"] = "Failure"
+        bytes_written: Optional[int] = None
+
+        try:
+            # --- Use Internal Tool ---
+            success = self._write_file_content(plan.file_path, plan.content)
+
+            if success:
+                status = "Success"
+                try:
+                    # Calculate bytes after successful write
+                    bytes_written = len(plan.content.encode('utf-8'))
+                    message = f"Successfully wrote {bytes_written} bytes to file: {plan.file_path}"
+                    logger.info(message)
+                except Exception as enc_e: # Handle potential encoding errors during calculation
+                    logger.error(f"Error encoding content to calculate bytes for {plan.file_path}: {enc_e}", exc_info=True)
+                    message = f"Successfully wrote content to file: {plan.file_path} (byte count unavailable)."
+                    # Status remains Success, but message reflects the issue
+            else:
+                # Error should have been logged by the tool method
+                status = "Failure"
+                message = f"Failed to write content to: {plan.file_path}. Tool returned False."
+                logger.warning(message)
+
+        except Exception as e:
+            # Catch unexpected errors during execution phase
+            status = "Failure"
+            message = f"Unexpected error during file write execution for {plan.file_path}: {e}"
+            logger.error(message, exc_info=True)
+
+        # --- Return Result ---
+        return WriteFileResult(
+            file_path=plan.file_path,
+            status=status,
+            message=message,
+            bytes_written=bytes_written # Will be None if write failed or byte count failed
         )
