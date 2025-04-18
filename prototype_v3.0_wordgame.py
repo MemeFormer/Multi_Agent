@@ -15,6 +15,8 @@ from src.agents.planner_agent import PlannerAgent
 from src.agents.executor_agent import ExecutorAgent
 from src.models.word_action_plan import WordActionPlan
 from src.models.execution_result import ExecutionResult
+from src.models.check_plan import CheckPlan # Added for Phase 2
+from src.models.check_result import CheckResult # Added for Phase 2
 
 # --- Configuration ---
 logging.basicConfig(
@@ -29,22 +31,24 @@ logging.getLogger("src.agents.executor_agent").setLevel(logging.INFO)
 
 
 # --- Model Selection (Explicit for New Roles) ---
-PLANNER_MODEL = "deepseek-r1-distill-qwen-32b" # Use Deepseek for planning
+PLANNER_MODEL = "deepseek-r1-distill-llama-70b" # Use the *new* Deepseek model for planning
 EXECUTOR_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct" # Maverick designated for execution (but not called in v3.0)
 
 # --- Main Orchestration ---
 async def main():
     """
-    Runs the Word Game prototype: Planner plans, Executor simulates execution.
+    Runs the Word Game prototype (Phase 2):
+    Orchestrates a check-then-add workflow for multiple words.
+    Planner plans checks and conditional adds, Executor executes them.
     """
-    logging.info("--- Starting Prototype V3.0: Word Game ---")
+    logging.info("--- Starting Prototype V3.0: Word Game (Phase 2) ---")
 
     try:
         adapter = GroqAdapter()
         logging.info("Groq Adapter initialized.")
 
         planner = PlannerAgent(adapter, model_id=PLANNER_MODEL)
-        # Executor is initialized but won't call its designated LLM in this version
+        # Executor now manages state (bins)
         executor = ExecutorAgent(adapter, model_id=EXECUTOR_MODEL)
         logging.info("Planner and Executor Agents initialized.")
 
@@ -55,49 +59,94 @@ async def main():
         logging.error(f"Unexpected initialization error: {e}", exc_info=True)
         return
 
-    # --- Define Sample Words ---
-    sample_words = ["apple", "sky", "Elephant", "rhythm", "Ocean", "banana", "Ice"]
-    word_to_test = random.choice(sample_words)
-    logging.info(f"Selected word for this run: '{word_to_test}'")
+    # --- Define Sample Words (with duplicates) ---
+    sample_words = ["apple", "sky", "Elephant", "rhythm", "Ocean", "banana", "Ice", "apple", "sky"]
+    logging.info(f"Processing words: {sample_words}")
 
-    # --- Workflow ---
-    plan: Optional[WordActionPlan] = None
-    result: Optional[ExecutionResult] = None
+    # --- Phase 2 Workflow: Check-Then-Add Loop ---
+    for word_to_test in sample_words:
+        logging.info(f"\n--- Processing Word: '{word_to_test}' ---")
+        check_plan: Optional[CheckPlan] = None
+        check_result: Optional[CheckResult] = None
+        final_add_plan: Optional[WordActionPlan] = None
+        execution_result: Optional[ExecutionResult] = None
+        word_status = "Failed - Unknown Error" # Default status
 
-    # 1. Planner creates plan
-    logging.info(f"Requesting plan from Planner for '{word_to_test}'...")
-    plan = await planner.plan_word_task(word_to_test)
+        try:
+            # 1. Plan Check
+            logging.info("Requesting check plan from Planner...")
+            check_plan = await planner.plan_check_task(word_to_test)
 
-    # 2. Executor executes plan (if valid)
-    if plan and isinstance(plan, WordActionPlan):
-        logging.info(f"Plan received from Planner. Requesting execution from Executor...")
-        result = await executor.execute_word_action(plan)
-    elif plan is None:
-        logging.error("Planner failed to return a plan. Aborting execution.")
-        result = ExecutionResult(status="Failure", message="Planner failed to generate a plan.")
-    else: # Should not happen if adapter validation works, but good practice
-        logging.error(f"Planner returned unexpected type: {type(plan)}. Aborting.")
-        result = ExecutionResult(status="Failure", message="Planner returned invalid plan type.")
+            if not check_plan or not isinstance(check_plan, CheckPlan):
+                logging.error("Planner failed to create a valid check plan.")
+                word_status = "Failed - Check Plan Generation"
+                continue # Skip to next word
 
-    # 3. Log Final Result
-    logging.info("--- Word Game Run Finished ---")
-    if result:
-        logging.info(f"Final Execution Result: Status='{result.status}', Message='{result.message}'")
+            # 2. Execute Check
+            logging.info("Check plan received. Requesting check execution from Executor...")
+            check_result = await executor.execute_check(check_plan)
+
+            if not check_result or not isinstance(check_result, CheckResult):
+                logging.error("Executor failed to return a valid check result.")
+                word_status = "Failed - Check Execution"
+                continue # Skip to next word
+
+            # 3. Plan Final Add
+            logging.info(f"Check result: '{check_result.status}'. Requesting final plan from Planner...")
+            final_add_plan = await planner.plan_final_add_task(word_to_test, check_result)
+
+            if check_result.status == "Present":
+                 logging.info("Word already present. Add plan correctly skipped by Planner.")
+                 word_status = "Skipped - Duplicate"
+                 # No need to continue, just won't execute add below
+
+            elif not final_add_plan and check_result.status == "Not Present":
+                 logging.warning("Planner failed to create final add plan even though word was not present.")
+                 word_status = "Failed - Final Plan Generation"
+                 # No need to continue, just won't execute add below
+
+            elif final_add_plan and isinstance(final_add_plan, WordActionPlan):
+                 logging.info("Final add plan received.")
+                 word_status = "Pending Execution" # Tentative status
+
+            else: # Handle unexpected case where plan is not None but not WordActionPlan
+                 logging.error(f"Planner returned unexpected type for final add plan: {type(final_add_plan)}")
+                 word_status = "Failed - Invalid Final Plan Type"
+
+
+            # 4. Execute Add (only if a valid plan exists)
+            if final_add_plan and isinstance(final_add_plan, WordActionPlan):
+                logging.info("Requesting add execution from Executor...")
+                execution_result = await executor.execute_add(final_add_plan)
+                if execution_result and execution_result.status == "Success":
+                    logging.info("Executor successfully added the word.")
+                    word_status = "Added Successfully"
+                else:
+                    logging.error(f"Executor failed to execute the add action. Result: {execution_result}")
+                    word_status = "Failed - Add Execution"
+            elif word_status == "Pending Execution": # If plan was expected but not generated correctly
+                 word_status = "Failed - Add Plan Missing"
+            elif word_status == "Skipped - Duplicate":
+                 logging.info("Add execution skipped because word was already present.")
+            else: # Other failure cases from planning steps
+                 logging.info(f"Add execution skipped due to previous failure: {word_status}")
+
+
+        except Exception as e:
+            logging.error(f"Unexpected error processing word '{word_to_test}': {e}", exc_info=True)
+            word_status = "Failed - Unexpected Error"
+        finally:
+             logging.info(f"--- Finished Processing Word: '{word_to_test}'. Status: {word_status} ---")
+
+
+    # --- Final Summary ---
+    logging.info("\n--- Word Game Phase 3 Finished ---")
+    if executor and hasattr(executor, 'data_dir') and hasattr(executor, 'bin_files'):
+        logging.info(f"Check the output files in the '{executor.data_dir}' directory:")
+        for bin_name, file_path in executor.bin_files.items():
+            logging.info(f"- {bin_name}: {file_path}")
     else:
-        # This case means the executor step wasn't even reached or failed unexpectedly
-        logging.error("Execution result not available.")
-
-    print("\n--- Run Summary ---")
-    print(f"Input Word: {word_to_test}")
-    if plan:
-        print(f"Planner Action: Place in '{plan.target_bin}'")
-    else:
-        print("Planner Action: FAILED")
-    if result:
-         print(f"Executor Result: {result.status} - {result.message}")
-    else:
-         print("Executor Result: NOT RUN / FAILED")
-    print("-------------------")
+        logging.warning("Executor object not available or file paths not initialized for final summary.")
 
 
 if __name__ == "__main__":
