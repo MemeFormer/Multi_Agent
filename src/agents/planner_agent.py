@@ -311,6 +311,80 @@ Content:
             logger.error(f"Planner unexpected error during plan_write_file_task: {e}", exc_info=True)
             return None
 
+    async def plan_modify_file_task(self, file_path: str, original_content: str) -> Optional[WriteFilePlan]:
+        """
+        Plans a task to modify file content (e.g., appending a line) and
+        outputs a WriteFilePlan with the *entire new* content.
+        """
+        logger.info(f"Planner Agent ({self.model_id}) planning file modification for: '{file_path}'")
+        # Preview only the first 100 characters to avoid excessive logging
+        content_preview = original_content[:100].replace('\n', '\\n') + ('...' if len(original_content) > 100 else '')
+        logger.debug(f"Original content preview for modification plan: '{content_preview}'")
+
+        # --- Generate line-numbered context for the prompt ---
+        lines_list = original_content.splitlines()
+        lines_dict = {i + 1: line for i, line in enumerate(lines_list)}
+        # Create a string representation for the prompt
+        line_numbered_content_for_prompt = "\n".join(f"{ln}: {line}" for ln, line in lines_dict.items())
+        last_line_number = len(lines_dict) if lines_dict else 0
+        # --- End line-numbered context generation ---
+
+        system_prompt = f"""
+You are a Planner Agent specializing in file modifications.
+Your task is to take the provided original file content (shown with line numbers) and modify it by appending the exact line "-- Modified by Planner (v8) --" *after the last line* (line {last_line_number}).
+Then, create a JSON plan for the Executor Agent to write the *entire modified content* back to the original file path.
+The plan MUST use the action "write_file".
+The JSON object you output MUST contain 'action', 'file_path', and 'content' (the full modified text).
+Generate ONLY the JSON object instance.
+"""
+
+        user_prompt = f"""
+File Path: "{file_path}"
+Last Line Number: {last_line_number}
+
+Original Content (with line numbers for reference):
+{line_numbered_content_for_prompt}
+
+Modify the content by appending the exact line "-- Modified by Planner (v8) --" after line {last_line_number}.
+Create the JSON plan (WriteFilePlan) containing the full modified content:
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        try:
+            response_plan: Optional[WriteFilePlan] = await self.adapter.chat_completion(
+                model=self.model_id,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                json_schema=WriteFilePlan
+            )
+
+            if response_plan and isinstance(response_plan, WriteFilePlan):
+                if response_plan.file_path != file_path:
+                    logger.warning(
+                        f"Planner returned plan for different file path: '{response_plan.file_path}' "
+                        f"instead of '{file_path}'. Using returned path."
+                    )
+                logger.info(f"Planner proposed modified write plan for: '{response_plan.file_path}'")
+                # Debug preview of the modified content
+                modified_content_preview = response_plan.content[:100].replace('\n', '\\n') \
+                    + ('...' if len(response_plan.content) > 100 else '')
+                logger.debug(f"Modified content preview in plan: '{modified_content_preview}'")
+                return response_plan
+
+            logger.error("Planner chat_completion did not return a valid WriteFilePlan for modification.")
+            return None
+
+        except (GroqError, ValueError, ValidationError, json.JSONDecodeError) as e:
+            logger.error(f"Planner agent failed during modify file plan proposal: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Planner unexpected error during plan_modify_file_task: {e}", exc_info=True)
+            return None
     # --- Deprecated Methods ---
 
     async def _plan_word_task_deprecated(self, word: str) -> Optional[WordActionPlan]:

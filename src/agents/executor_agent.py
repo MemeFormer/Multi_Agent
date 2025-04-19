@@ -3,7 +3,7 @@
 import logging
 import asyncio
 import os
-from typing import Optional, List, Literal
+from typing import Dict, Optional, List, Literal, Tuple
 
 from src.adapters.groq_adapter import GroqAdapter
 from src.models.word_action_plan import WordActionPlan
@@ -84,23 +84,33 @@ class ExecutorAgent:
             logger.error(f"Error appending word '{word}' to file {file_path}: {e}", exc_info=True)
             return False
 
-    def _read_file_content(self, file_path: str) -> Optional[str]:
-        """Reads the entire content of a file and returns it as a string."""
-        logger.debug(f"Attempting to read content from: {file_path}")
+    def _read_file_content(self, file_path: str) -> Tuple[Optional[str], Optional[Dict[int, str]]]:
+        """Reads the entire content of a file, returning it as a string and a line-number dict."""
+        logger.debug(f"Attempting to read content and lines from: {file_path}")
+        content: Optional[str] = None
+        lines_dict: Optional[Dict[int, str]] = None
+        
         if not os.path.exists(file_path):
             logger.error(f"File not found for reading: {file_path}")
-            return None
+            return None, None # Return tuple on failure
+            
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            logger.debug(f"Successfully read {len(content)} characters from {file_path}.")
-            return content
+                
+            # Generate line-numbered dictionary
+            lines_list = content.splitlines() # Splits lines, removes trailing newlines from strings
+            lines_dict = {i + 1: line for i, line in enumerate(lines_list)}
+            
+            logger.debug(f"Successfully read {len(content)} characters and {len(lines_dict)} lines from {file_path}.")
+            return content, lines_dict # Return tuple on success
+            
         except (OSError, UnicodeDecodeError) as e:
             logger.error(f"Error reading file content from {file_path}: {e}", exc_info=True)
-            return None
+            return None, None # Return tuple on failure
         except Exception as e:
             logger.error(f"Unexpected error reading file {file_path}: {e}", exc_info=True)
-            return None
+            return None, None # Return tuple on failure
 
     def _write_file_content(self, file_path: str, content: str) -> bool:
         """Writes the given content to the file, overwriting existing content."""
@@ -189,24 +199,28 @@ class ExecutorAgent:
         """ Executes a read file plan using the _read_file_content tool. """
         logger.info(f"Executor Agent received plan: Read file '{plan.file_path}' using tool.")
         content: Optional[str] = None
+        lines_dict: Optional[Dict[int, str]] = None
         message: Optional[str] = None
         status: Literal["Success", "Failure"] = "Failure"
 
         try:
-            content = self._read_file_content(plan.file_path) # Use the tool
+            content, lines_dict = self._read_file_content(plan.file_path)
 
-            if content is not None:
+            if content is not None and lines_dict is not None:
                 status = "Success"
-                message = f"Successfully read {len(content)} characters from file: {plan.file_path}"
+                message = f"Successfully read {len(content)} characters ({len(lines_dict)} lines) from file: {plan.file_path}"
                 logger.info(message)
             else:
                 status = "Failure"
-                message = f"Failed to read file content from: {plan.file_path}. Tool returned None."
+                message = f"Failed to read file content/lines from: {plan.file_path}. Tool returned None."
                 logger.warning(message)
+                content = None
+                lines_dict = None
 
         except Exception as e:
             status = "Failure"
             content = None
+            lines_dict = None
             message = f"Unexpected error during file read execution for {plan.file_path}: {e}"
             logger.error(message, exc_info=True)
 
@@ -214,6 +228,7 @@ class ExecutorAgent:
             file_path=plan.file_path,
             status=status,
             content=content,
+            lines=lines_dict,
             message=message
         )
 
