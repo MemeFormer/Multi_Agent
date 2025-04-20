@@ -14,6 +14,17 @@ from src.models.read_file_plan import ReadFilePlan       # <-- Added for Phase 5
 from src.models.file_content_result import FileContentResult # <-- Added for Phase 5
 from src.models.write_file_plan import WriteFilePlan     # <-- Added for Phase 6
 from src.models.write_file_result import WriteFileResult # <-- Added for Phase 6
+from src.models.apply_patch_plan import ApplyPatchPlan   # <-- Added for Phase 9
+from src.models.apply_patch_result import ApplyPatchResult # <-- Added for Phase 9
+
+# Import patch tool components
+from src.tools.patch_tool import (
+    text_to_patch,
+    patch_to_commit,
+    apply_commit,
+    identify_files_needed,
+    DiffError # Import the specific error type
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
@@ -131,6 +142,23 @@ class ExecutorAgent:
             return False
         except Exception as e: # Catch unexpected errors
             logger.error(f"Unexpected error writing file {file_path}: {e}", exc_info=True)
+            return False
+
+    def _remove_file(self, file_path: str) -> bool:
+        """Removes the specified file. Returns True if successful or file already gone, False on error."""
+        logger.debug(f"Attempting to remove file: {file_path}")
+        try:
+            os.remove(file_path)
+            logger.info(f"Successfully removed file: {file_path}")
+            return True
+        except FileNotFoundError:
+            logger.warning(f"File not found during removal (considered success): {file_path}")
+            return True # File is already gone, which is the desired state
+        except OSError as e:
+            logger.error(f"Error removing file {file_path}: {e}", exc_info=True)
+            return False
+        except Exception as e: # Catch unexpected errors
+            logger.error(f"Unexpected error removing file {file_path}: {e}", exc_info=True)
             return False
 
     # --- Public Execution Methods ---
@@ -274,3 +302,113 @@ class ExecutorAgent:
             message=message,
             bytes_written=bytes_written # Will be None if write failed or byte count failed
         )
+
+    async def execute_apply_patch(self, plan: ApplyPatchPlan) -> ApplyPatchResult:
+        """ Executes an apply patch plan using the patch_tool logic. """
+        logger.info(f"Executor Agent received plan: Apply patch described as: {plan.reasoning or 'No reasoning provided'}")
+        original_files: Dict[str, str] = {}
+        file_results: Optional[Dict[str, str]] = None
+
+        try:
+            # 1. Identify files needed for the patch
+            logger.debug("Identifying files needed for the patch...")
+            needed_files = identify_files_needed(plan.patch_content)
+            logger.info(f"Patch requires access to files: {needed_files}")
+
+            # 2. Load original content of needed files
+            for file_path in needed_files:
+                logger.debug(f"Reading original content of: {file_path}")
+                content, _ = self._read_file_content(file_path) # Ignore lines dict for now
+                if content is None:
+                    # If a required file cannot be read, the patch cannot be applied safely.
+                    error_msg = f"Failed to read required file for patching: {file_path}"
+                    logger.error(error_msg)
+                    return ApplyPatchResult(
+                        status="Failure",
+                        message=error_msg,
+                        error_details=f"Could not read file content for {file_path}."
+                    )
+                original_files[file_path] = content
+            logger.info(f"Successfully loaded content for {len(original_files)} required files.")
+
+            # 3. Define local I/O wrappers for the synchronous patch tool functions
+            def write_wrapper(path: str, content: str) -> bool:
+                # Note: Calling sync tool from within async method context
+                logger.debug(f"[Wrapper] Writing file: {path}")
+                return self._write_file_content(path, content)
+
+            def remove_wrapper(path: str) -> bool:
+                # Note: Calling sync tool from within async method context
+                logger.debug(f"[Wrapper] Removing file: {path}")
+                return self._remove_file(path)
+
+            # 4. Parse the patch text
+            logger.debug("Parsing patch content...")
+            parsed_patch, fuzz = text_to_patch(plan.patch_content, original_files)
+            logger.info(f"Patch parsed successfully. Fuzz factor: {fuzz}")
+
+            # 5. Convert patch actions to commit actions
+            logger.debug("Converting parsed patch to commit actions...")
+            commit_actions = patch_to_commit(parsed_patch, original_files)
+            logger.info(f"Commit created with {len(commit_actions.changes)} changes.")
+
+            # 6. Apply the commit using the wrappers
+            logger.info("Applying commit actions to the filesystem...")
+            file_results = apply_commit(commit_actions, write_wrapper, remove_wrapper)
+            logger.info(f"Commit application finished. Results per file: {file_results}")
+
+            # 7. Determine overall status based on file results
+            has_errors = False
+            has_success = False
+            for status in file_results.values():
+                if "Error" in status:
+                    has_errors = True
+                else:
+                    # Consider "Deleted", "Added", "Updated", "Moved" as success indicators
+                    has_success = True
+
+            final_status: Literal["Success", "Failure", "Partial Success"]
+            final_message: str
+
+            if has_errors and has_success:
+                final_status = "Partial Success"
+                final_message = "Patch applied with some errors."
+                logger.warning(final_message)
+            elif has_errors and not has_success:
+                final_status = "Failure"
+                final_message = "Patch application failed for all targeted files."
+                logger.error(final_message)
+            elif not has_errors and has_success:
+                 final_status = "Success"
+                 final_message = "Patch applied successfully to all targeted files."
+                 logger.info(final_message)
+            else: # No errors, no successes (e.g., empty patch or only targeting non-existent files for delete)
+                 final_status = "Success" # Consider this success as no errors occurred
+                 final_message = "Patch application completed without errors (no changes might have been needed)."
+                 logger.info(final_message)
+
+
+            return ApplyPatchResult(
+                status=final_status,
+                message=final_message,
+                file_results=file_results
+            )
+
+        except DiffError as e:
+            error_msg = f"Patch Error: {e}"
+            logger.error(error_msg, exc_info=True)
+            return ApplyPatchResult(
+                status="Failure",
+                message="Failed to parse or apply patch due to format/content error.",
+                file_results=file_results, # Include partial results if available
+                error_details=str(e)
+            )
+        except Exception as e:
+            error_msg = f"Unexpected error during patch execution: {e}"
+            logger.error(error_msg, exc_info=True)
+            return ApplyPatchResult(
+                status="Failure",
+                message="An unexpected error occurred during patch application.",
+                file_results=file_results, # Include partial results if available
+                error_details=str(e)
+            )

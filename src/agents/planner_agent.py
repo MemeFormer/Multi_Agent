@@ -12,6 +12,9 @@ from src.models.check_plan import CheckPlan
 from src.models.check_result import CheckResult
 from src.models.read_file_plan import ReadFilePlan # <-- Added for Phase 5
 from src.models.write_file_plan import WriteFilePlan # <-- Added for Phase 6
+from src.models.apply_patch_plan import ApplyPatchPlan # <-- Added for Phase 9
+from groq.types.chat.chat_completion import ChatCompletion
+
 
 # Configure logging
 # Consider moving basicConfig to the main script entry point if not already done
@@ -385,6 +388,183 @@ Create the JSON plan (WriteFilePlan) containing the full modified content:
         except Exception as e:
             logger.error(f"Planner unexpected error during plan_modify_file_task: {e}", exc_info=True)
             return None
+
+    # --- Patching Methods (Phase 9) ---
+
+    async def plan_apply_patch_task(
+        self,
+        file_path: str,
+        original_content: str,
+        modification_request: str, # The user's request, e.g., "Refactor function X", "Add a print statement"
+        # Optional: Add lines_dict: Optional[Dict[int, str]] = None if useful for prompt context
+    ) -> Optional[ApplyPatchPlan]:
+        """
+        Plans a task to generate a V4A diff patch based on a modification request.
+
+        Args:
+            file_path: The path to the file to be modified.
+            original_content: The original content of the file.
+            modification_request: The user's request describing the desired change.
+
+        Returns:
+            An ApplyPatchPlan object containing the generated patch content if successful, None otherwise.
+        """
+        logger.info(f"Planner Agent ({self.model_id}) planning apply patch task for: '{file_path}'")
+        logger.debug(f"Modification request: '{modification_request}'")
+
+        system_prompt = """
+You are an expert, meticulous software developer AI assistant. Your task is to generate a precise V4A diff patch to modify a given file based on a user request.
+
+**Workflow:**
+1.  Deeply understand the modification request.
+2.  Carefully analyze the provided original code content.
+3.  Identify the exact lines and context needing change.
+4.  Generate a V4A format patch containing ONLY the necessary changes.
+
+**V4A Diff Format Rules:**
+- Start the entire patch with `*** Begin Patch`.
+- End the entire patch with `*** End Patch`.
+- Specify the file operation: `*** Update File: [path/to/file]`. Use the provided file path.
+- For each change block:
+    - Use `@@ ClassOrFunction` markers ONLY if needed to disambiguate context within the file. Often, no `@@` marker is needed if the context lines are unique.
+    - Provide exactly 3 lines of unchanged context before the change (unless at file start or near previous change).
+    - Mark lines to be removed with `- ` (minus sign followed by a space).
+    - Mark lines to be added with `+ ` (plus sign followed by a space).
+    - Provide exactly 3 lines of unchanged context after the change (unless at file end or near next change).
+    - Do NOT duplicate context lines between adjacent change blocks.
+- Ensure correct indentation for all lines (+, -, context).
+
+**CRITICAL Constraint:**
+- **DO NOT** use standard unified diff hunk headers like `@@ -x,y +a,b @@`. Only use `@@ ClassOrFunction` if *absolutely necessary* for context, otherwise rely on the 3 context lines.
+
+**Example:**
+If the original content is:
+```
+Line 1: A
+Line 2: B
+Line 3: C
+Line 4: D
+```
+And the request is "Insert 'Line 2.5: New' between Line 2 and Line 3", the correct V4A patch is:
+```
+*** Begin Patch
+*** Update File: [path/to/file]
+ Line 1: A
+ Line 2: B
++Line 2.5: New
+ Line 3: C
+ Line 4: D
+*** End Patch
+```
+(Note: No `@@` marker was needed here as the context was sufficient)
+
+**Your Task:**
+Generate ONLY the V4A patch string based on the user request and original content, starting with `*** Begin Patch` and ending with `*** End Patch`.
+**Do NOT include any reasoning, <think> tags, or any other text outside the patch markers.**
+"""
+
+        user_prompt = f"""
+    File Path: "{file_path}"
+
+    Modification Request: "{modification_request}"
+
+    Original Content:
+    """
+
+   
+        messages = [{"role": "system", "content": system_prompt}, 
+                    {"role": "user", "content": user_prompt}]
+
+        try:
+            # Get the completion object from the adapter (no json_schema specified)
+            # Add 'from groq.types.chat.chat_completion import ChatCompletion' at the top if needed
+            completion_object: Optional['ChatCompletion'] = await self.adapter.chat_completion( # Type hint might need import
+                model=self.model_id, messages=messages, temperature=0.0, max_tokens=2048 # Increase max_tokens?
+                # NO json_schema parameter here
+            )
+
+            if not completion_object:
+                logger.error("Planner received no response object from adapter.")
+                return None
+
+            # --- Extract the string content from the completion object ---
+            raw_patch_content: Optional[str] = None
+            try:
+                 if completion_object.choices and completion_object.choices[0].message and completion_object.choices[0].message.content:
+                     raw_patch_content = completion_object.choices[0].message.content
+                     logger.info("Successfully extracted text content from LLM response.")
+                     logger.debug(f"Raw patch content received from LLM:\n---\n{raw_patch_content}\n---")
+                 else:
+                     logger.error(f"Could not extract message content from completion object structure: {completion_object}")
+                     return None
+            except AttributeError as e:
+                 logger.error(f"Error accessing content in completion object: {e}. Object: {completion_object}")
+                 return None
+            # ---------------------------------------------------------------
+
+            if not raw_patch_content:
+                # This case means content was extracted but is empty
+                logger.error("Planner received empty patch content string from LLM.")
+                return None
+
+            # --- Improved validation and cleaning ---
+            logger.debug(f"Attempting to validate raw patch content:\n{raw_patch_content[:500]}...") # Log preview
+            start_marker = "*** Begin Patch"
+            end_marker = "*** End Patch"
+
+            # Find the START marker
+            start_pos = raw_patch_content.find(start_marker)
+            if start_pos == -1:
+                logger.error(f"Planner LLM output missing '{start_marker}'. Raw output:\n{raw_patch_content}")
+                return None
+
+            # Find the END marker *after* the start marker
+            end_pos = raw_patch_content.find(end_marker, start_pos) # Search only after start_pos
+            if end_pos == -1:
+                logger.error(f"Planner LLM output missing '{end_marker}' after '{start_marker}'. Raw output:\n{raw_patch_content}")
+                return None
+
+            # Extract ONLY the content between markers, including the markers themselves
+            validated_patch_content = raw_patch_content[start_pos : end_pos + len(end_marker)].strip()
+
+            # Ensure nothing important exists BEFORE the start marker (like <think>)
+            # We allow whitespace/newlines before it.
+            text_before_patch = raw_patch_content[:start_pos].strip()
+            if text_before_patch:
+                 logger.warning(f"Planner included unexpected text before '{start_marker}': '{text_before_patch[:100]}...' - Attempting to use patch anyway.")
+                 # If this happens often, prompt needs more work.
+
+            logger.debug(f"Cleaned Validated Patch Content:\n{validated_patch_content}")
+            # --- End Improved validation ---
+
+            # Basic check: Ensure the file path mentioned in the patch matches the input
+            expected_update_line = f"*** Update File: {file_path}"
+            if expected_update_line not in validated_patch_content:
+                 # Also check for Add/Delete if those were possibilities based on request
+                 expected_add_line = f"*** Add File: {file_path}"
+                 expected_delete_line = f"*** Delete File: {file_path}"
+                 if not any(marker in validated_patch_content for marker in [expected_add_line, expected_delete_line]):
+                      logger.warning(f"Patch content does not seem to reference the correct file path '{file_path}'. Patch:\n{validated_patch_content}")
+                      # Decide whether to proceed or fail. Let's fail for now.
+                      # return None # Or maybe proceed cautiously?
+
+            # Create the plan object
+            plan = ApplyPatchPlan(
+                action="apply_patch",
+                patch_content=validated_patch_content,
+                reasoning=f"Apply patch to '{file_path}' based on request: {modification_request}" # Add simple reasoning
+            )
+            logger.info(f"Planner proposed apply patch plan for: '{file_path}'")
+            return plan
+
+        except (GroqError, ValueError) as e: # Catch API errors or value errors during processing
+            logger.error(f"Planner agent failed during apply patch plan proposal: {e}", exc_info=True)
+            return None
+        except Exception as e: # Catch unexpected errors
+            logger.error(f"Planner unexpected error during plan_apply_patch_task: {e}", exc_info=True)
+            return None
+
+
     # --- Deprecated Methods ---
 
     async def _plan_word_task_deprecated(self, word: str) -> Optional[WordActionPlan]:

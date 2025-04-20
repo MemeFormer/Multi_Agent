@@ -1,0 +1,4 @@
+Line 1: Some original content.
+Line 2: The second line.
+Line 3: Another line here.
+Line 4: End of original file.
