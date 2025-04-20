@@ -479,7 +479,7 @@ Generate ONLY the V4A patch string based on the user request and original conten
             # Get the completion object from the adapter (no json_schema specified)
             # Add 'from groq.types.chat.chat_completion import ChatCompletion' at the top if needed
             completion_object: Optional['ChatCompletion'] = await self.adapter.chat_completion( # Type hint might need import
-                model=self.model_id, messages=messages, temperature=0.0, max_tokens=2048 # Increase max_tokens?
+                model=self.model_id, messages=messages, temperature=0.0, max_tokens=self.max_tokens # <--- Use self.max_tokens
                 # NO json_schema parameter here
             )
 
@@ -507,37 +507,47 @@ Generate ONLY the V4A patch string based on the user request and original conten
                 logger.error("Planner received empty patch content string from LLM.")
                 return None
 
-            # --- Improved validation and cleaning ---
-            logger.debug(f"Attempting to validate raw patch content:\n{raw_patch_content[:500]}...") # Log preview
+            # --- Line-based validation and extraction ---
+            logger.debug(f"Attempting line-based validation of raw patch content:\n{raw_patch_content[:500]}...")
             start_marker = "*** Begin Patch"
             end_marker = "*** End Patch"
+            validated_patch_content: Optional[str] = None
+            patch_lines: List[str] = [] # Need from typing import List
+            in_patch_block = False
 
-            # Find the START marker
-            start_pos = raw_patch_content.find(start_marker)
-            if start_pos == -1:
-                logger.error(f"Planner LLM output missing '{start_marker}'. Raw output:\n{raw_patch_content}")
-                return None
+            lines = raw_patch_content.splitlines() # Split into lines
 
-            # Find the END marker *after* the start marker
-            end_pos = raw_patch_content.find(end_marker, start_pos) # Search only after start_pos
-            if end_pos == -1:
-                logger.error(f"Planner LLM output missing '{end_marker}' after '{start_marker}'. Raw output:\n{raw_patch_content}")
-                return None
+            for line in lines:
+                stripped_line = line.strip() # Use stripped line for marker checks
 
-            # Extract ONLY the content between markers, including the markers themselves
-            validated_patch_content = raw_patch_content[start_pos : end_pos + len(end_marker)].strip()
+                if stripped_line == start_marker:
+                    if in_patch_block:
+                        logger.warning(f"Found nested '{start_marker}'? Ignoring previous.")
+                        patch_lines = [] # Restart if nested start found
+                    in_patch_block = True
+                    patch_lines.append(line) # Add original line (with whitespace)
+                    continue # Move to next line
 
-            # Ensure nothing important exists BEFORE the start marker (like <think>)
-            # We allow whitespace/newlines before it.
-            text_before_patch = raw_patch_content[:start_pos].strip()
-            if text_before_patch:
-                 logger.warning(f"Planner included unexpected text before '{start_marker}': '{text_before_patch[:100]}...' - Attempting to use patch anyway.")
-                 # If this happens often, prompt needs more work.
+                if in_patch_block:
+                    patch_lines.append(line) # Add original line
+                    if stripped_line == end_marker:
+                        # Found the end marker, potentially the end of the patch
+                        # Check if any non-whitespace comes *after* this line?
+                        # For simplicity now, we'll assume this is the correct end.
+                        break # Stop processing lines once end marker is found
 
-            logger.debug(f"Cleaned Validated Patch Content:\n{validated_patch_content}")
-            # --- End Improved validation ---
+            # After loop, check if we found a valid block
+            if not patch_lines or patch_lines[-1].strip() != end_marker:
+                logger.error(f"Could not extract a valid block ending with '{end_marker}'. Last few lines processed: {lines[-5:]}")
+                return None # Failed to find valid block
+            else:
+                # Join the extracted lines back together
+                validated_patch_content = "\n".join(patch_lines)
+                logger.debug(f"Extracted Patch Content (line-based):\n{validated_patch_content}")
+            # --- End Line-based validation ---
 
             # Basic check: Ensure the file path mentioned in the patch matches the input
+            # This check now runs on the potentially valid 'validated_patch_content'
             expected_update_line = f"*** Update File: {file_path}"
             if expected_update_line not in validated_patch_content:
                  # Also check for Add/Delete if those were possibilities based on request

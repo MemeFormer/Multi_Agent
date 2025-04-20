@@ -31,7 +31,7 @@ async def main():
     try:
         adapter = GroqAdapter()
         # Increase max_tokens for planner if patches might be large
-        planner = PlannerAgent(adapter, model_id=PLANNER_MODEL, max_tokens=3000)
+        planner = PlannerAgent(adapter, model_id=PLANNER_MODEL, max_tokens=8192) # Increased tokens
         executor = ExecutorAgent(adapter, model_id=EXECUTOR_MODEL) # Executor model not used for patch apply
         logging.info("Adapter and Agents initialized.")
     except Exception as e:
